@@ -1,174 +1,478 @@
-"""Core bot loop — runs every 60 seconds via APScheduler."""
+"""
+Main bot loop — runs every 60 seconds via APScheduler.
+
+Startup sequence
+----------------
+1. init_db() / restore_from_backup()
+2. Load persisted paper_cash_aud from memory table (survives restarts)
+3. APScheduler fires bot_tick() every BOT_INTERVAL_SECONDS
+
+Tick sequence
+-------------
+1. Fetch all CoinSpot prices  →  save to price_history
+2. Load full memory summary from DB
+3. Resolve current portfolio (paper balance from memory, or live from API)
+4. risk.check_open_trades()  →  auto-close stop-loss / take-profit hits
+5. claude_brain.analyse_market()  →  list of AI decisions
+6. For each non-hold decision: validate → execute (paper or real)
+7. Save new open trades to open_trades table
+8. Portfolio snapshot
+9. Persist paper_cash_aud to memory table
+10. Broadcast full state update via WebSocket
+"""
+from __future__ import annotations
+
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
-from claude_brain import get_trading_decision
-from coinspot import get_latest_prices, get_balances, place_buy_order, place_sell_order
+from claude_brain import analyse_market
+from coinspot import get_latest_prices, get_my_balances, place_buy_order, place_sell_order
 from config import (
     BOT_INTERVAL_SECONDS,
     PAPER_BALANCE,
-    STOP_LOSS_PCT,
-    TAKE_PROFIT_PCT,
+    REAL_TRADING_CONFIRMED,
     TRADING_MODE,
 )
 from database import (
-    get_all_memory,
-    get_open_positions,
-    get_trades,
+    close_trade,
+    get_memory,
+    get_open_trades,
+    init_db,
+    load_memory_summary,
     log_bot_run,
-    log_trade,
+    log_prices,
+    open_trade,
+    restore_from_backup,
     set_memory,
+    snapshot_portfolio,
 )
-from risk import check_exit_signals, max_position_size, validate_trade
+from risk import calculate_trade_size, check_open_trades, validate_trade
 
 log = logging.getLogger(__name__)
 
-# In-memory state (also persisted to DB)
-_paper_balance: float = PAPER_BALANCE
-_paper_positions: list[dict] = []
-_last_decision: dict = {}
-_broadcast_callback = None  # Set by main.py to push WS updates
+# ── Module-level state ────────────────────────────────────────────────────────
+
+_paper_balance: float = PAPER_BALANCE   # overwritten by _load_state() on startup
+_last_decisions: list[dict] = []        # most recent Claude decisions
+_last_prices: dict = {}                 # most recent price payload
+_last_tick_at: datetime | None = None
+_tick_count: int = 0
+_is_running: bool = False
+_broadcast_callback = None              # set by main.py
 
 
-def set_broadcast_callback(cb):
+# ── Real-trading guard ────────────────────────────────────────────────────────
+
+def _real_trading_enabled() -> bool:
+    """Both TRADING_MODE=real and REAL_TRADING_CONFIRMED=true must be set."""
+    return TRADING_MODE == "real" and REAL_TRADING_CONFIRMED
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def set_broadcast_callback(cb) -> None:
     global _broadcast_callback
     _broadcast_callback = cb
 
 
-def get_last_decision() -> dict:
-    return _last_decision
+def get_last_decisions() -> list[dict]:
+    return _last_decisions
 
 
-async def _broadcast(event: str, data: dict):
+def get_last_prices() -> dict:
+    return _last_prices
+
+
+def get_tick_count() -> int:
+    return _tick_count
+
+
+def get_last_tick_at() -> datetime | None:
+    return _last_tick_at
+
+
+def is_running() -> bool:
+    return _is_running
+
+
+async def _broadcast(event: str, data: dict) -> None:
     if _broadcast_callback:
-        await _broadcast_callback({"event": event, "data": data})
+        try:
+            await _broadcast_callback({"event": event, "data": data, "ts": datetime.now(timezone.utc).isoformat()})
+        except Exception as exc:
+            log.warning("Broadcast error: %s", exc)
 
 
-async def _get_balance() -> float:
+async def _get_cash_balance() -> float:
+    """Return available AUD cash. Uses DB for paper, CoinSpot API for real."""
     global _paper_balance
-    if TRADING_MODE == "paper":
+    if not _real_trading_enabled():
         return _paper_balance
-    try:
-        result = await get_balances()
-        aud = result.get("balances", {}).get("AUD", {}).get("balance", 0)
-        return float(aud)
-    except Exception as e:
-        log.error("Failed to fetch live balance: %s", e)
+    result = await get_my_balances()
+    if result is None:
+        log.error("Failed to fetch live balance — using 0")
         return 0.0
+    return result.get("aud", 0.0)
 
 
-async def _check_stop_loss_take_profit(prices: dict):
-    """Check all open positions against current prices and exit if needed."""
-    positions = await get_open_positions()
-    for pos in positions:
-        coin = pos["coin"]
-        price_data = prices.get("prices", {}).get(coin, {})
-        current_price = float(price_data.get("last", pos["price"]))
-        signal = check_exit_signals(pos["price"], current_price)
+async def _get_portfolio(open_trades: list[dict], cash_aud: float) -> dict:
+    open_vals = sum(float(t.get("value_aud", 0)) for t in open_trades)
+    return {
+        "cash_aud": cash_aud,
+        "holdings_value_aud": open_vals,
+        "total_value_aud": cash_aud + open_vals,
+        "open_trades": open_trades,
+    }
 
-        if signal["action"] == "sell":
-            log.info("Risk exit: %s — %s", coin, signal["reason"])
-            qty = pos["quantity"]
-            aud_val = qty * current_price
-            pnl = aud_val - pos["aud_value"]
 
-            if TRADING_MODE == "paper":
-                global _paper_balance
+# ── Startup ───────────────────────────────────────────────────────────────────
+
+async def initialise_bot() -> None:
+    """
+    Must be awaited once before the scheduler starts.
+    Initialises the DB and reloads persisted state.
+    """
+    global _paper_balance, _is_running
+
+    await init_db()
+    await restore_from_backup()
+
+    # Reload paper balance from last known value (survives restart)
+    saved_balance = await get_memory("paper_cash_aud")
+    if saved_balance is not None:
+        _paper_balance = float(saved_balance)
+        log.info("Restored paper balance: AUD %.2f", _paper_balance)
+    else:
+        _paper_balance = PAPER_BALANCE
+        await set_memory("paper_cash_aud", _paper_balance)
+        log.info("Initialised paper balance: AUD %.2f", _paper_balance)
+
+    if TRADING_MODE == "real" and not REAL_TRADING_CONFIRMED:
+        log.warning(
+            "TRADING_MODE=real but REAL_TRADING_CONFIRMED is not true — "
+            "bot will run in PAPER mode until REAL_TRADING_CONFIRMED=true is set in .env"
+        )
+
+    _is_running = True
+    log.info(
+        "Bot initialised. mode=%s real_enabled=%s interval=%ds",
+        TRADING_MODE, _real_trading_enabled(), BOT_INTERVAL_SECONDS,
+    )
+
+
+# ── Risk exit processing ──────────────────────────────────────────────────────
+
+async def _process_risk_exits(open_trades: list[dict], prices: dict) -> list[dict]:
+    """
+    Close any trades that have breached stop-loss or take-profit.
+    Returns the updated open_trades list after exits are processed.
+    """
+    global _paper_balance
+
+    exits = check_open_trades(open_trades, prices)
+    if not exits:
+        return open_trades
+
+    for exit_trade in exits:
+        trade_id = exit_trade["id"]
+        coin = exit_trade["coin"]
+        current_price = exit_trade["current_price"]
+        qty = float(exit_trade["quantity"])
+        aud_val = qty * current_price
+        exit_reason = exit_trade["exit_reason"]
+
+        log.info("Auto-exit %s [%s]: %s", coin, exit_reason, exit_trade["message"])
+
+        if not _real_trading_enabled():
+            # Paper: close in DB and credit cash
+            closed = await close_trade(trade_id, current_price, exit_reason)
+            if closed:
                 _paper_balance += aud_val
-                # Mark position as closed (set pnl)
-                await log_trade(
-                    coin=coin, side="sell", mode="paper",
-                    price=current_price, quantity=qty,
-                    aud_value=aud_val, pnl=pnl,
-                    reason=signal["reason"],
-                )
-            else:
-                await place_sell_order(coin, qty, current_price)
+                await set_memory("paper_cash_aud", _paper_balance)
+                await _broadcast("position_closed", {
+                    "coin": coin,
+                    "exit_reason": exit_reason,
+                    "pnl_aud": exit_trade["pnl_aud"],
+                    "pnl_percent": exit_trade["pnl_percent"],
+                    "message": exit_trade["message"],
+                })
+        else:
+            # Real: execute sell on exchange
+            result = await place_sell_order(coin, qty)
+            if result is None:
+                log.error("Exchange sell for %s failed — position remains open", coin)
+                continue
+            await close_trade(trade_id, current_price, exit_reason)
+            await _broadcast("position_closed", {
+                "coin": coin,
+                "exit_reason": exit_reason,
+                "pnl_aud": exit_trade["pnl_aud"],
+                "pnl_percent": exit_trade["pnl_percent"],
+            })
 
-            await _broadcast("position_closed", {"coin": coin, "pnl": pnl, "reason": signal["reason"]})
+    # Reload open trades after exits
+    return await get_open_trades()
 
 
-async def bot_tick():
-    """Single bot cycle — fetch prices → check risk → ask Claude → execute."""
-    global _last_decision, _paper_balance
+# ── Trade execution ───────────────────────────────────────────────────────────
 
-    log.info("[%s] Bot tick — mode=%s", datetime.utcnow().isoformat(), TRADING_MODE)
+async def _execute_buy(
+    decision: dict,
+    prices: dict,
+    portfolio: dict,
+) -> bool:
+    """Execute a buy decision. Returns True if trade was placed."""
+    global _paper_balance
 
-    # 1. Fetch prices
-    try:
-        prices = await get_latest_prices()
-    except Exception as e:
-        log.error("Price fetch failed: %s", e)
+    coin = decision["coin"]
+    _pd = prices.get("prices", {})
+    price_data = _pd.get(coin) or _pd.get(coin.lower(), {})
+    ask_price = float(price_data.get("ask") or price_data.get("last") or 0)
+
+    if ask_price <= 0:
+        log.warning("No ask price for %s — skipping buy", coin)
+        return False
+
+    sizing = calculate_trade_size(portfolio["total_value_aud"])
+    if not sizing["ok"]:
+        log.warning("Position sizing rejected for %s: %s", coin, sizing["reason"])
+        return False
+
+    # Can't spend more cash than we have
+    aud_spend = min(sizing["max_aud"], portfolio["cash_aud"])
+    qty = round(aud_spend / ask_price, 8)
+
+    validation = validate_trade(
+        {
+            "coin": coin, "side": "buy", "direction": "long",
+            "aud_value": aud_spend, "quantity": qty,
+        },
+        portfolio,
+    )
+    if not validation["ok"]:
+        log.warning("Buy validation failed for %s: %s", coin, validation["reason"])
+        return False
+
+    if not _real_trading_enabled():
+        # Paper trade
+        trade_id = await open_trade(
+            coin=coin, direction="long",
+            entry_price=ask_price, quantity=qty,
+            value_aud=aud_spend, mode="paper",
+        )
+        _paper_balance -= aud_spend
+        await set_memory("paper_cash_aud", _paper_balance)
+        log.info(
+            "PAPER BUY  %s  qty=%.8f  price=%.4f  AUD=%.2f  [trade_id=%d]",
+            coin, qty, ask_price, aud_spend, trade_id,
+        )
+        await _broadcast("trade_executed", {
+            "side": "buy", "coin": coin, "qty": qty,
+            "price": ask_price, "aud": aud_spend, "mode": "paper",
+        })
+    else:
+        # Real trade
+        result = await place_buy_order(coin, aud_spend)
+        if result is None:
+            log.error("Exchange buy for %s failed", coin)
+            return False
+        # Record the open trade at the price we expected (exchange fill may differ slightly)
+        await open_trade(
+            coin=coin, direction="long",
+            entry_price=ask_price, quantity=qty,
+            value_aud=aud_spend, mode="real",
+        )
+        await _broadcast("trade_executed", {
+            "side": "buy", "coin": coin, "qty": qty,
+            "price": ask_price, "aud": aud_spend, "mode": "real",
+        })
+
+    return True
+
+
+async def _execute_sell(
+    decision: dict,
+    prices: dict,
+    portfolio: dict,
+) -> bool:
+    """Close an existing position based on a sell decision. Returns True if trade was placed."""
+    global _paper_balance
+
+    coin = decision["coin"]
+    open_trades = portfolio["open_trades"]
+    position = next((t for t in open_trades if t["coin"] == coin), None)
+
+    if position is None:
+        log.warning("Sell signal for %s but no open position found", coin)
+        return False
+
+    _pd = prices.get("prices", {})
+    price_data = _pd.get(coin) or _pd.get(coin.lower(), {})
+    bid_price = float(price_data.get("bid") or price_data.get("last") or position["entry_price"])
+    qty = float(position["quantity"])
+    aud_val = qty * bid_price
+
+    validation = validate_trade(
+        {
+            "coin": coin, "side": "sell",
+            "direction": position.get("direction", "long"),
+            "aud_value": aud_val, "quantity": qty,
+        },
+        portfolio,
+    )
+    if not validation["ok"]:
+        log.warning("Sell validation failed for %s: %s", coin, validation["reason"])
+        return False
+
+    if not _real_trading_enabled():
+        closed = await close_trade(position["id"], bid_price, "ai_decision")
+        if closed is None:
+            log.error("DB close_trade failed for position %d", position["id"])
+            return False
+        _paper_balance += aud_val
+        await set_memory("paper_cash_aud", _paper_balance)
+        log.info(
+            "PAPER SELL %s  qty=%.8f  price=%.4f  pnl=AUD %.2f (%.2f%%)",
+            coin, qty, bid_price, closed["pnl_aud"], closed["pnl_percent"],
+        )
+        await _broadcast("trade_executed", {
+            "side": "sell", "coin": coin, "qty": qty,
+            "price": bid_price, "pnl_aud": closed["pnl_aud"],
+            "pnl_percent": closed["pnl_percent"], "mode": "paper",
+        })
+    else:
+        result = await place_sell_order(coin, qty)
+        if result is None:
+            log.error("Exchange sell for %s failed", coin)
+            return False
+        closed = await close_trade(position["id"], bid_price, "ai_decision")
+        await _broadcast("trade_executed", {
+            "side": "sell", "coin": coin, "qty": qty,
+            "price": bid_price,
+            "pnl_aud": closed["pnl_aud"] if closed else None,
+            "mode": "real",
+        })
+
+    return True
+
+
+# ── Main tick ─────────────────────────────────────────────────────────────────
+
+async def bot_tick() -> None:
+    """Single bot cycle. Safe to call manually for testing."""
+    global _last_decisions, _last_prices, _last_tick_at, _tick_count, _paper_balance
+
+    tick_start = datetime.now(timezone.utc)
+    log.info("── Bot tick #%d  %s  mode=%s ──", _tick_count + 1, tick_start.isoformat(), TRADING_MODE)
+
+    # ── Step 1: Fetch prices ──────────────────────────────────────────────────
+    prices = await get_latest_prices()
+    if prices is None:
+        log.error("Price fetch failed — aborting tick")
+        await _broadcast("bot_error", {"message": "Price fetch failed", "ts": tick_start.isoformat()})
         return
 
-    # 2. Check stop loss / take profit on open positions
-    await _check_stop_loss_take_profit(prices)
+    _last_prices = prices
+    await log_prices(prices)
 
-    # 3. Gather context for Claude
-    balance = await _get_balance()
-    open_positions = await get_open_positions()
-    trade_history = await get_trades(50)
-    memory = await get_all_memory()
+    # ── Step 2: Load memory summary ───────────────────────────────────────────
+    memory_summary = await load_memory_summary()
 
-    # 4. Ask Claude for a decision
-    try:
-        decision = await get_trading_decision(
-            prices=prices,
-            open_positions=open_positions,
-            trade_history=trade_history,
-            memory=memory,
-            balance_aud=balance,
-        )
-    except Exception as e:
-        log.error("Claude decision failed: %s", e)
-        decision = {"decision": "hold", "coin": None, "reasoning": str(e), "confidence": 0}
+    # ── Step 3: Resolve portfolio ─────────────────────────────────────────────
+    cash = await _get_cash_balance()
+    open_trades = await get_open_trades()
+    portfolio = await _get_portfolio(open_trades, cash)
 
-    _last_decision = decision
-    log.info("Decision: %s %s (confidence=%.2f)", decision.get("decision"), decision.get("coin"), decision.get("confidence", 0))
+    # ── Step 4: Risk exits ────────────────────────────────────────────────────
+    open_trades = await _process_risk_exits(open_trades, prices)
+    # Refresh portfolio after exits (balance may have changed)
+    cash = await _get_cash_balance()
+    portfolio = await _get_portfolio(open_trades, cash)
 
-    # 5. Persist memory updates
-    for k, v in decision.get("memory_update", {}).items():
-        await set_memory(k, v)
+    # ── Step 5: Claude analysis ───────────────────────────────────────────────
+    decisions = await analyse_market(prices, portfolio, memory_summary)
+    _last_decisions = decisions
 
-    # 6. Execute trade
-    action = decision.get("decision", "hold")
-    coin = decision.get("coin")
-    reason = decision.get("reasoning", "")
+    # ── Step 6: Execute non-hold decisions ────────────────────────────────────
+    buys_placed = 0
+    sells_placed = 0
 
-    if action == "buy" and coin:
-        sizing = max_position_size(balance, 1)  # price=1 placeholder; we use AUD fraction
-        price_data = prices.get("prices", {}).get(coin, {})
-        price = float(price_data.get("ask", 0))
-        if price > 0:
-            sizing = max_position_size(balance, price)
-            aud_spend = sizing["aud_to_spend"]
-            validation = validate_trade("buy", coin, aud_spend, balance, open_positions)
-            if validation["ok"]:
-                if TRADING_MODE == "paper":
-                    _paper_balance -= aud_spend
-                    qty = sizing["quantity"]
-                    await log_trade(coin, "buy", "paper", price, qty, aud_spend, reason=reason)
-                    await _broadcast("trade_executed", {"side": "buy", "coin": coin, "aud": aud_spend})
-                else:
-                    await place_buy_order(coin, aud_spend, price)
-            else:
-                log.warning("Trade blocked: %s", validation["reason"])
+    for decision in decisions:
+        if decision["action"] == "hold":
+            continue
 
-    elif action == "sell" and coin:
-        for pos in open_positions:
-            if pos["coin"] == coin:
-                price_data = prices.get("prices", {}).get(coin, {})
-                price = float(price_data.get("bid", pos["price"]))
-                aud_val = pos["quantity"] * price
-                pnl = aud_val - pos["aud_value"]
-                if TRADING_MODE == "paper":
-                    _paper_balance += aud_val
-                    await log_trade(coin, "sell", "paper", price, pos["quantity"], aud_val, pnl=pnl, reason=reason)
-                    await _broadcast("trade_executed", {"side": "sell", "coin": coin, "pnl": pnl})
-                else:
-                    await place_sell_order(coin, pos["quantity"], price)
+        # Refresh open trades and portfolio before each trade so
+        # each decision sees the latest state (previous buys reduce cash, etc.)
+        open_trades = await get_open_trades()
+        cash = await _get_cash_balance()
+        portfolio = await _get_portfolio(open_trades, cash)
 
-    # 7. Log run
-    await log_bot_run(TRADING_MODE, action, reason, prices)
-    await _broadcast("bot_tick", {"decision": decision, "balance": _paper_balance if TRADING_MODE == "paper" else balance})
+        if decision["action"] == "buy":
+            placed = await _execute_buy(decision, prices, portfolio)
+            if placed:
+                buys_placed += 1
+        elif decision["action"] == "sell":
+            placed = await _execute_sell(decision, prices, portfolio)
+            if placed:
+                sells_placed += 1
+
+    # ── Step 7 + 8: Final state + snapshot ───────────────────────────────────
+    open_trades = await get_open_trades()
+    cash = await _get_cash_balance()
+    open_vals = sum(float(t.get("value_aud", 0)) for t in open_trades)
+    total_value = cash + open_vals
+
+    await snapshot_portfolio(
+        total_value_aud=total_value,
+        cash_aud=cash,
+        holdings_value_aud=open_vals,
+        mode="paper" if not _real_trading_enabled() else "real",
+    )
+
+    # ── Step 9: Persist paper balance ─────────────────────────────────────────
+    if not _real_trading_enabled():
+        await set_memory("paper_cash_aud", _paper_balance)
+
+    # ── Step 10: Log run + broadcast ─────────────────────────────────────────
+    primary_action = "hold"
+    primary_coin = None
+    if decisions:
+        actionable = [d for d in decisions if d["action"] != "hold"]
+        if actionable:
+            best = max(actionable, key=lambda d: d["confidence"])
+            primary_action = best["action"]
+            primary_coin = best["coin"]
+
+    await log_bot_run(
+        mode="paper" if not _real_trading_enabled() else "real",
+        decision=primary_action,
+        reasoning=f"{len(decisions)} decisions; {buys_placed} buys, {sells_placed} sells placed",
+        prices=prices,
+    )
+
+    _last_tick_at = tick_start
+    _tick_count += 1
+
+    elapsed_ms = (datetime.now(timezone.utc) - tick_start).total_seconds() * 1000
+    log.info(
+        "Tick complete: %d decisions, %d buys, %d sells placed  (%.0fms)",
+        len(decisions), buys_placed, sells_placed, elapsed_ms,
+    )
+
+    await _broadcast("bot_tick", {
+        "tick": _tick_count,
+        "mode": TRADING_MODE,
+        "real_enabled": _real_trading_enabled(),
+        "prices": prices.get("prices", {}),
+        "open_trades": open_trades,
+        "portfolio": {
+            "cash_aud": cash,
+            "holdings_value_aud": open_vals,
+            "total_value_aud": total_value,
+        },
+        "decisions": decisions,
+        "buys_placed": buys_placed,
+        "sells_placed": sells_placed,
+        "elapsed_ms": round(elapsed_ms),
+    })

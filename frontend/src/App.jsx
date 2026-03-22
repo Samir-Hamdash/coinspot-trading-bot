@@ -12,24 +12,35 @@ const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
 export default function App() {
   const [connected, setConnected] = useState(false);
-  const [lastEvent, setLastEvent] = useState(null);
   const [mode, setMode] = useState("paper");
+  const [realEnabled, setRealEnabled] = useState(false);
+  const [portfolio, setPortfolio] = useState(null);
+  const [decisions, setDecisions] = useState([]);
+  const [prices, setPrices] = useState({});
+  const [openTrades, setOpenTrades] = useState([]);
+  const [lastEvent, setLastEvent] = useState(null);
   const wsRef = useRef(null);
 
   useEffect(() => {
     const connect = () => {
       const ws = new WebSocket(WS_URL);
       wsRef.current = ws;
-
       ws.onopen = () => setConnected(true);
-      ws.onclose = () => {
-        setConnected(false);
-        setTimeout(connect, 3000); // auto-reconnect
-      };
+      ws.onclose = () => { setConnected(false); setTimeout(connect, 3000); };
       ws.onerror = () => ws.close();
       ws.onmessage = (e) => {
         try {
-          setLastEvent(JSON.parse(e.data));
+          const msg = JSON.parse(e.data);
+          setLastEvent(msg);
+          const d = msg.data || {};
+          if (msg.event === "init" || msg.event === "bot_tick") {
+            if (d.mode) setMode(d.mode);
+            if (d.real_enabled !== undefined) setRealEnabled(d.real_enabled);
+            if (d.prices) setPrices(d.prices);
+            if (d.open_trades) setOpenTrades(d.open_trades);
+            if (d.decisions) setDecisions(d.decisions);
+            if (d.portfolio) setPortfolio(d.portfolio);
+          }
         } catch {}
       };
     };
@@ -37,58 +48,38 @@ export default function App() {
     return () => wsRef.current?.close();
   }, []);
 
-  useEffect(() => {
-    fetch(`${API_URL}/api/health`)
-      .then((r) => r.json())
-      .then((d) => setMode(d.mode))
-      .catch(() => {});
-  }, []);
-
   return (
     <div className="min-h-screen bg-gray-950 text-gray-100 font-mono">
-      {/* Header */}
       <header className="border-b border-gray-800 px-6 py-4 flex items-center justify-between">
         <div className="flex items-center gap-3">
           <span className="text-2xl font-bold text-emerald-400">CoinSpot AI Bot</span>
-          <span
-            className={`text-xs px-2 py-0.5 rounded-full border ${
-              connected
-                ? "border-emerald-500 text-emerald-400"
-                : "border-red-500 text-red-400"
-            }`}
-          >
+          <span className={`text-xs px-2 py-0.5 rounded-full border ${
+            connected ? "border-emerald-500 text-emerald-400" : "border-red-500 text-red-400"
+          }`}>
             {connected ? "LIVE" : "DISCONNECTED"}
           </span>
         </div>
-        <ModeToggle mode={mode} />
+        <ModeToggle mode={mode} realEnabled={realEnabled} apiUrl={API_URL} />
       </header>
 
-      {/* Main grid */}
       <main className="p-6 grid grid-cols-12 gap-4">
-        {/* Row 1 */}
         <div className="col-span-12">
-          <Dashboard apiUrl={API_URL} lastEvent={lastEvent} />
+          <Dashboard portfolio={portfolio} openTrades={openTrades} apiUrl={API_URL} />
         </div>
-
-        {/* Row 2 */}
         <div className="col-span-12 lg:col-span-8">
-          <PriceTickerAll apiUrl={API_URL} lastEvent={lastEvent} />
+          <PriceTickerAll prices={prices} apiUrl={API_URL} />
         </div>
         <div className="col-span-12 lg:col-span-4">
-          <AIReasoningPanel apiUrl={API_URL} lastEvent={lastEvent} />
-        </div>
-
-        {/* Row 3 */}
-        <div className="col-span-12 lg:col-span-6">
-          <OpenTrades apiUrl={API_URL} lastEvent={lastEvent} />
+          <AIReasoningPanel decisions={decisions} apiUrl={API_URL} />
         </div>
         <div className="col-span-12 lg:col-span-6">
-          <TradeHistory apiUrl={API_URL} lastEvent={lastEvent} />
+          <OpenTrades openTrades={openTrades} lastEvent={lastEvent} apiUrl={API_URL} />
         </div>
-
-        {/* Row 4 */}
+        <div className="col-span-12 lg:col-span-6">
+          <TradeHistory lastEvent={lastEvent} apiUrl={API_URL} />
+        </div>
         <div className="col-span-12">
-          <MemoryStats apiUrl={API_URL} lastEvent={lastEvent} />
+          <MemoryStats lastEvent={lastEvent} apiUrl={API_URL} />
         </div>
       </main>
     </div>

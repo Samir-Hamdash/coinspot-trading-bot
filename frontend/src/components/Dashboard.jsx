@@ -1,56 +1,48 @@
 import { useEffect, useState } from "react";
 
-export default function Dashboard({ apiUrl, lastEvent }) {
-  const [balance, setBalance] = useState(null);
-  const [positions, setPositions] = useState([]);
-  const [trades, setTrades] = useState([]);
-
-  const fetch_data = () => {
-    fetch(`${apiUrl}/api/positions`).then((r) => r.json()).then(setPositions).catch(() => {});
-    fetch(`${apiUrl}/api/trades?limit=200`).then((r) => r.json()).then(setTrades).catch(() => {});
-  };
-
-  useEffect(() => { fetch_data(); }, []);
+export default function Dashboard({ portfolio, openTrades, apiUrl }) {
+  const [stats, setStats] = useState(null);
 
   useEffect(() => {
-    if (lastEvent?.event === "bot_tick") {
-      setBalance(lastEvent.data?.balance);
-      fetch_data();
+    fetch(`${apiUrl}/memory/stats`).then((r) => r.json()).then(setStats).catch(() => {});
+  }, []);
+
+  // Refresh stats after each trade closes
+  useEffect(() => {
+    if (portfolio) {
+      fetch(`${apiUrl}/memory/stats`).then((r) => r.json()).then(setStats).catch(() => {});
     }
-  }, [lastEvent]);
+  }, [portfolio]);
 
-  const totalPnl = trades
-    .filter((t) => t.pnl != null)
-    .reduce((acc, t) => acc + t.pnl, 0);
-
-  const openCount = positions.length;
-
-  const winRate = (() => {
-    const closed = trades.filter((t) => t.pnl != null);
-    if (!closed.length) return null;
-    const wins = closed.filter((t) => t.pnl > 0).length;
-    return ((wins / closed.length) * 100).toFixed(1);
-  })();
+  const cash = portfolio?.cash_aud ?? null;
+  const totalValue = portfolio?.total_value_aud ?? null;
+  const openCount = openTrades?.length ?? 0;
+  const winRate = stats?.win_rate_pct;
+  const totalTrades = stats?.total_trades ?? 0;
 
   const cards = [
     {
-      label: "Balance (AUD)",
-      value: balance != null ? `$${balance.toFixed(2)}` : "—",
+      label: "Cash Balance",
+      value: cash != null ? `$${Number(cash).toFixed(2)}` : "—",
+      sub: totalValue != null ? `Portfolio $${Number(totalValue).toFixed(2)}` : null,
       color: "text-emerald-400",
     },
     {
       label: "Open Positions",
       value: openCount,
+      sub: `${openCount}/5 slots used`,
       color: "text-blue-400",
-    },
-    {
-      label: "Total PnL",
-      value: `${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}`,
-      color: totalPnl >= 0 ? "text-emerald-400" : "text-red-400",
     },
     {
       label: "Win Rate",
       value: winRate != null ? `${winRate}%` : "—",
+      sub: totalTrades ? `${totalTrades} closed trades` : "No trades yet",
+      color: winRate >= 50 ? "text-emerald-400" : winRate != null ? "text-red-400" : "text-gray-400",
+    },
+    {
+      label: "Best Coin",
+      value: stats?.best_coins?.[0]?.coin ?? "—",
+      sub: stats?.best_coins?.[0] ? `avg ${stats.best_coins[0].avg_pnl_pct > 0 ? "+" : ""}${stats.best_coins[0].avg_pnl_pct}%` : null,
       color: "text-yellow-400",
     },
   ];
@@ -61,6 +53,7 @@ export default function Dashboard({ apiUrl, lastEvent }) {
         <div key={c.label} className="bg-gray-900 border border-gray-800 rounded-xl p-4">
           <div className="text-xs text-gray-500 uppercase tracking-wider mb-1">{c.label}</div>
           <div className={`text-2xl font-bold ${c.color}`}>{c.value}</div>
+          {c.sub && <div className="text-xs text-gray-600 mt-1">{c.sub}</div>}
         </div>
       ))}
     </div>

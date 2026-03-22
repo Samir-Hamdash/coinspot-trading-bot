@@ -1,74 +1,81 @@
 import { useEffect, useState } from "react";
 
-const CONFIDENCE_COLOR = (c) => {
-  if (c >= 0.7) return "text-emerald-400";
-  if (c >= 0.4) return "text-yellow-400";
-  return "text-red-400";
-};
-
-const DECISION_BADGE = {
-  buy: "bg-emerald-900/60 text-emerald-300 border-emerald-700",
+const ACTION_BADGE = {
+  buy:  "bg-emerald-900/60 text-emerald-300 border-emerald-700",
   sell: "bg-red-900/60 text-red-300 border-red-700",
-  hold: "bg-gray-800 text-gray-400 border-gray-600",
+  hold: "bg-gray-800 text-gray-400 border-gray-700",
 };
 
-export default function AIReasoningPanel({ apiUrl, lastEvent }) {
-  const [decision, setDecision] = useState(null);
+const TREND_DOT = {
+  bullish: "bg-emerald-400",
+  bearish: "bg-red-400",
+  neutral: "bg-gray-500",
+};
 
-  const load = () =>
-    fetch(`${apiUrl}/api/decision`).then((r) => r.json()).then(setDecision).catch(() => {});
+function ConfidenceBar({ value }) {
+  const pct = Math.min(100, Math.max(0, value));
+  const color = pct >= 70 ? "bg-emerald-500" : pct >= 45 ? "bg-yellow-500" : "bg-red-500";
+  return (
+    <div className="flex items-center gap-2">
+      <div className="flex-1 bg-gray-800 rounded-full h-1.5">
+        <div
+          className={`h-1.5 rounded-full transition-all duration-700 ${color}`}
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+      <span className={`text-xs font-semibold w-8 text-right ${
+        pct >= 70 ? "text-emerald-400" : pct >= 45 ? "text-yellow-400" : "text-red-400"
+      }`}>{pct.toFixed(0)}%</span>
+    </div>
+  );
+}
 
-  useEffect(() => { load(); }, []);
-  useEffect(() => { if (lastEvent?.event === "bot_tick") setDecision(lastEvent.data?.decision); }, [lastEvent]);
+export default function AIReasoningPanel({ decisions, apiUrl }) {
+  const [localDecisions, setLocalDecisions] = useState([]);
 
-  if (!decision) {
+  // Seed from API on mount; live updates come from the decisions prop
+  useEffect(() => {
+    fetch(`${apiUrl}/api/decisions`).then((r) => r.json()).then((d) => {
+      if (Array.isArray(d)) setLocalDecisions(d);
+    }).catch(() => {});
+  }, []);
+
+  const active = (decisions?.length ? decisions : localDecisions)
+    .filter((d) => d.action !== "hold")
+    .slice(0, 5);
+
+  const all = (decisions?.length ? decisions : localDecisions).slice(0, 5);
+  const display = active.length ? active : all;
+
+  if (!display.length) {
     return (
       <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 h-full flex items-center justify-center">
-        <p className="text-gray-600 text-sm">Waiting for first AI decision…</p>
+        <p className="text-gray-600 text-sm">Waiting for first AI analysis…</p>
       </div>
     );
   }
 
-  const { decision: action, coin, confidence = 0, reasoning, risk_notes } = decision;
-  const badgeClass = DECISION_BADGE[action] || DECISION_BADGE.hold;
-
   return (
-    <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 flex flex-col gap-3">
+    <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 flex flex-col gap-3 h-full">
       <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">
-        AI Reasoning
+        AI Decisions ({display.length})
       </h2>
-
-      <div className="flex items-center gap-3">
-        <span className={`text-sm font-bold px-3 py-1 rounded-full border ${badgeClass}`}>
-          {(action || "hold").toUpperCase()}
-          {coin ? ` ${coin}` : ""}
-        </span>
-        <span className={`text-sm font-semibold ${CONFIDENCE_COLOR(confidence)}`}>
-          {(confidence * 100).toFixed(0)}% confident
-        </span>
+      <div className="flex flex-col gap-3 overflow-y-auto">
+        {display.map((d, i) => (
+          <div key={`${d.coin}-${i}`} className="border border-gray-800 rounded-lg p-3 bg-gray-800/30">
+            <div className="flex items-center gap-2 mb-2">
+              <span className={`text-xs font-bold px-2 py-0.5 rounded-full border ${ACTION_BADGE[d.action] || ACTION_BADGE.hold}`}>
+                {d.action.toUpperCase()}
+              </span>
+              <span className="font-bold text-gray-200">{d.coin}</span>
+              <span className={`w-2 h-2 rounded-full ml-auto ${TREND_DOT[d.trend] || TREND_DOT.neutral}`}
+                    title={d.trend} />
+            </div>
+            <ConfidenceBar value={d.confidence} />
+            <p className="text-xs text-gray-400 mt-2 leading-relaxed line-clamp-3">{d.reasoning}</p>
+          </div>
+        ))}
       </div>
-
-      {/* Confidence bar */}
-      <div className="w-full bg-gray-800 rounded-full h-1.5">
-        <div
-          className={`h-1.5 rounded-full transition-all duration-700 ${
-            confidence >= 0.7 ? "bg-emerald-500" : confidence >= 0.4 ? "bg-yellow-500" : "bg-red-500"
-          }`}
-          style={{ width: `${(confidence * 100).toFixed(0)}%` }}
-        />
-      </div>
-
-      <div>
-        <div className="text-xs text-gray-500 mb-1 uppercase tracking-wide">Reasoning</div>
-        <p className="text-sm text-gray-300 leading-relaxed">{reasoning}</p>
-      </div>
-
-      {risk_notes && (
-        <div>
-          <div className="text-xs text-gray-500 mb-1 uppercase tracking-wide">Risk Notes</div>
-          <p className="text-sm text-yellow-300/80 leading-relaxed">{risk_notes}</p>
-        </div>
-      )}
     </div>
   );
 }

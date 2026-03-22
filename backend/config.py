@@ -5,7 +5,6 @@ load_dotenv()
 
 COINSPOT_API_KEY = os.getenv("COINSPOT_API_KEY", "")
 COINSPOT_API_SECRET = os.getenv("COINSPOT_API_SECRET", "")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 TRADING_MODE = os.getenv("TRADING_MODE", "paper")  # "paper" or "real"
 PAPER_BALANCE = float(os.getenv("PAPER_BALANCE", "1000"))
 

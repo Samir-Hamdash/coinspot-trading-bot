@@ -26,7 +26,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
-from claude_brain import analyse_market
+from mcp_server import request_mcp_analysis
 from coinspot import get_latest_prices, get_my_balances, place_buy_order, place_sell_order
 from config import (
     BOT_INTERVAL_SECONDS,
@@ -391,7 +391,7 @@ async def bot_tick() -> None:
     portfolio = await _get_portfolio(open_trades, cash)
 
     # ── Step 5: Claude analysis ───────────────────────────────────────────────
-    decisions = await analyse_market(prices, portfolio, memory_summary)
+    decisions = await request_mcp_analysis(prices, portfolio, memory_summary)
     _last_decisions = decisions
 
     # ── Step 6: Execute non-hold decisions ────────────────────────────────────

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "coinspot-trading-bot": {
+      "command": "python",
+      "args": ["backend/mcp_server.py"],
+      "cwd": "C:\\Users\\shamd\\Downloads\\Coinspot_Ai_Trading_Bot"
+    }
+  }
+}
